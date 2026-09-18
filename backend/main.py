@@ -265,21 +265,66 @@ async def create_journey(req: JourneyCreateRequest, db: Session = Depends(get_db
     db.add(journey)
     db.commit()
 
-    leg = JourneyLeg(
-        journey_id=j_id,
-        leg_order=1,
-        train_number=train.train_number,
-        from_station_code=req.from_station.upper(),
-        to_station_code=req.to_station.upper(),
-        scheduled_departure=train.departure_time,
-        scheduled_arrival=train.arrival_time,
-        actual_departure=train.departure_time,
-        actual_arrival=train.arrival_time,
-        delay_departure_min=0,
-        delay_arrival_min=0,
-        status="ON_TIME"
-    )
-    db.add(leg)
+    # Check if this is a multi-leg journey where train terminates at an interchange hub
+    transfer_station_code = train.destination_station_code
+    if transfer_station_code != req.to_station.upper():
+        leg1 = JourneyLeg(
+            journey_id=j_id,
+            leg_order=1,
+            train_number=train.train_number,
+            from_station_code=req.from_station.upper(),
+            to_station_code=transfer_station_code,
+            scheduled_departure=train.departure_time,
+            scheduled_arrival=train.arrival_time,
+            actual_departure=train.departure_time,
+            actual_arrival=train.arrival_time,
+            delay_departure_min=0,
+            delay_arrival_min=0,
+            status="ON_TIME"
+        )
+        db.add(leg1)
+
+        # Find connecting train from transfer hub to destination
+        conn_train = db.query(Train).filter(
+            Train.source_station_code == transfer_station_code,
+            Train.destination_station_code == req.to_station.upper()
+        ).first()
+
+        if not conn_train:
+            conn_train = db.query(Train).filter(Train.destination_station_code == req.to_station.upper()).first()
+
+        if conn_train:
+            leg2 = JourneyLeg(
+                journey_id=j_id,
+                leg_order=2,
+                train_number=conn_train.train_number,
+                from_station_code=transfer_station_code,
+                to_station_code=req.to_station.upper(),
+                scheduled_departure=conn_train.departure_time,
+                scheduled_arrival=conn_train.arrival_time,
+                actual_departure=conn_train.departure_time,
+                actual_arrival=conn_train.arrival_time,
+                delay_departure_min=0,
+                delay_arrival_min=0,
+                status="ON_TIME"
+            )
+            db.add(leg2)
+    else:
+        leg = JourneyLeg(
+            journey_id=j_id,
+            leg_order=1,
+            train_number=train.train_number,
+            from_station_code=req.from_station.upper(),
+            to_station_code=req.to_station.upper(),
+            scheduled_departure=train.departure_time,
+            scheduled_arrival=train.arrival_time,
+            actual_departure=train.departure_time,
+            actual_arrival=train.arrival_time,
+            delay_departure_min=0,
+            delay_arrival_min=0,
+            status="ON_TIME"
+        )
+        db.add(leg)
 
     booking = Booking(
         pnr=pnr,
@@ -628,6 +673,64 @@ def get_passenger_notifications(passenger_id: str, db: Session = Depends(get_db)
 def get_events(limit: int = 20, db: Session = Depends(get_db)):
     event_engine = EventEngine(db)
     return event_engine.get_recent_events(limit=limit)
+
+
+@app.post("/events")
+async def post_event(req: EventInjectionRequest, db: Session = Depends(get_db)):
+    """
+    Ingests railway event (delay, ETA change, cancellation) and triggers
+    journey impact recalculation, alternative routing, and notification alerts.
+    """
+    event_engine = EventEngine(db)
+    payload = req.details or {}
+    if req.delay_minutes is not None:
+        payload["delay_minutes"] = req.delay_minutes
+
+    result = event_engine.process_event(
+        event_type=req.event_type,
+        train_id=req.train_id,
+        payload=payload,
+        effective_date=req.effective_date,
+        source=req.source
+    )
+
+    # Check notification dispatch if threshold is met
+    new_delay = int(payload.get("delay_minutes", 0))
+    if new_delay >= 30:
+        notif_service = NotificationService(db)
+        alt_engine = AlternativeEngine(db)
+        for j_info in result.get("affected_journeys", []):
+            j_id = j_info.get("journey_id")
+            j_status = j_info.get("status", "SAFE")
+            journey_obj = db.query(Journey).filter(Journey.id == j_id).first()
+            passenger = journey_obj.booking.passenger if (journey_obj and journey_obj.booking) else None
+            p_id = passenger.id if passenger else "PASS-DEMO-01"
+            p_name = passenger.name if passenger else "Kishore Stalin"
+
+            alt_matrix = alt_engine.get_complete_alternative_comparison(j_id)
+            ai_explanation = gpt4all_agent.explain_journey({
+                "journey_status": j_status,
+                "current_train": {"number": req.train_id, "delay_minutes": new_delay, "expected_arrival": "09:45"},
+                "alternatives": alt_matrix.get("alternatives", [])
+            })
+            try:
+                await notif_service.send_disruption_alert(
+                    journey_id=j_id,
+                    passenger_id=p_id,
+                    passenger_name=p_name,
+                    train_number=req.train_id,
+                    delay_minutes=new_delay,
+                    expected_arrival="09:45",
+                    journey_status=j_status,
+                    alternatives=alt_matrix.get("alternatives", []),
+                    ai_explanation=ai_explanation,
+                    event_type=req.event_type
+                )
+            except Exception as e:
+                logger.warning(f"Notification alert dispatch error: {e}")
+
+    await broadcast_event_update(result)
+    return result
 
 
 @app.get("/events/stream")
