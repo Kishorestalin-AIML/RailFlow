@@ -5,9 +5,12 @@ import datetime
 from typing import Optional
 from sqlalchemy.orm import Session
 from backend.database.database import SessionLocal
-from backend.models.schema import TrainLiveStatus, JourneyLeg, DataRefreshLog
+from backend.models.schema import TrainLiveStatus, JourneyLeg, DataRefreshLog, Journey
 from backend.integrations.railway_api import railway_adapter
 from backend.engines.event_engine import EventEngine
+from backend.engines.alternative_engine import AlternativeEngine
+from backend.ai.gpt4all_agent import gpt4all_agent
+from backend.services.notification_service import NotificationService
 
 logger = logging.getLogger("live_update_service")
 
@@ -119,6 +122,51 @@ class LiveUpdateService:
                             },
                             source=status_data.get("source", "railway_api")
                         )
+
+                        # Automatic Alternative Search & Notification Dispatch
+                        notif_service = NotificationService(db)
+                        alt_engine = AlternativeEngine(db)
+
+                        for j_info in event_result.get("affected_journeys", []):
+                            j_id = j_info.get("journey_id")
+                            j_status = j_info.get("status", "SAFE")
+                            journey_obj = db.query(Journey).filter(Journey.id == j_id).first()
+                            passenger = journey_obj.booking.passenger if (journey_obj and journey_obj.booking) else None
+                            p_id = passenger.id if passenger else "PASS-DEMO-01"
+                            p_name = passenger.name if passenger else "Kishore Stalin"
+
+                            if notif_service.should_notify(
+                                journey_id=j_id,
+                                event_type="TRAIN_DELAY",
+                                delay_minutes=new_delay,
+                                previous_status="SAFE" if prev_delay < 30 else "AT_RISK",
+                                current_status=j_status
+                            ):
+                                alt_matrix = alt_engine.get_complete_alternative_comparison(j_id)
+                                ai_explanation = gpt4all_agent.explain_journey({
+                                    "journey_status": j_status,
+                                    "current_train": {
+                                        "number": train_no,
+                                        "delay_minutes": new_delay,
+                                        "expected_arrival": status_data.get("actual_arrival", "08:30")
+                                    },
+                                    "alternatives": alt_matrix.get("alternatives", [])
+                                })
+                                try:
+                                    await notif_service.send_disruption_alert(
+                                        journey_id=j_id,
+                                        passenger_id=p_id,
+                                        passenger_name=p_name,
+                                        train_number=train_no,
+                                        delay_minutes=new_delay,
+                                        expected_arrival=status_data.get("actual_arrival", "08:30"),
+                                        journey_status=j_status,
+                                        alternatives=alt_matrix.get("alternatives", []),
+                                        ai_explanation=ai_explanation,
+                                        event_type="TRAIN_DELAY"
+                                    )
+                                except Exception as n_err:
+                                    logger.warning(f"Failed to dispatch alert: {n_err}")
 
                         # Broadcast via SSE callback if available
                         if self._broadcast_callback:

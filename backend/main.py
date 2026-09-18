@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 import asyncio
 import datetime
 import logging
@@ -12,7 +13,11 @@ from sqlalchemy.orm import Session
 
 from backend.database.database import get_db, init_db, SessionLocal
 from backend.database.seed import seed_database, reset_demo_journey
-from backend.models.schema import Train, Station, RailwayEvent, Journey, TrainSchedule, TrainFare, TrainAvailability, TrainLiveStatus
+from backend.models.schema import (
+    Train, Station, RailwayEvent, Journey, JourneyLeg, Booking,
+    TrainSchedule, TrainFare, TrainAvailability, TrainLiveStatus,
+    Passenger, PassengerContact, NotificationRecord
+)
 from backend.schemas.api_schemas import (
     JourneyDetailResponse,
     TrainSearchResult,
@@ -21,27 +26,35 @@ from backend.schemas.api_schemas import (
     DecisionResult,
     RecommendationResult,
     EventInjectionRequest,
-    QuickDelayRequest,
-    StrandsExplainRequest,
-    StrandsExplainResponse,
+    PassengerRegistrationRequest,
+    PassengerResponse,
+    JourneyCreateRequest,
+    NotificationItem,
+    GPT4AllExplainRequest,
+    GPT4AllExplainResponse,
     SystemHealthResponse
 )
 from backend.integrations.railway_api import railway_adapter
+from backend.integrations.railradar_client import railradar_client
+from backend.integrations.sms_provider import sms_provider
+from backend.integrations.email_provider import email_provider
 from backend.engines.journey_state import JourneyStateEngine
 from backend.engines.impact_engine import ImpactEngine
 from backend.engines.decision_engine import DecisionEngine
 from backend.engines.action_engine import ActionEngine
 from backend.engines.event_engine import EventEngine
-from backend.ai.strands_agent import strands_assistant
+from backend.engines.alternative_engine import AlternativeEngine
+from backend.ai.gpt4all_agent import gpt4all_agent
 from backend.services.live_update_service import live_update_service
+from backend.services.notification_service import NotificationService
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("railmind")
 
 app = FastAPI(
     title="RailMind - Real-Time Railway Journey Intelligence",
-    description="Operational intelligence and decision support layer above Indian Railway information systems with AWS Strands Agent explanation.",
-    version="1.1.0"
+    description="Operational intelligence and decision support layer above Indian Railway information systems powered by RailRadar API and local GPT4All LLM.",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -92,8 +105,8 @@ def get_system_health(db: Session = Depends(get_db)):
         status="HEALTHY",
         database="SQLite3 (railway.db)",
         data_adapter_mode=railway_adapter.current_data_source,
-        data_adapter_base_url=railway_adapter.client.base_url or "Local Simulation Mode",
-        strands_status="READY (Strands Agents v1.56)",
+        data_adapter_base_url=railradar_client.base_url,
+        strands_status="READY (GPT4All Local LLM)",
         active_journeys_count=journeys_count,
         events_count=events_count,
         last_updated=datetime.datetime.utcnow().strftime("%I:%M %p UTC")
@@ -105,30 +118,41 @@ def get_system_status(db: Session = Depends(get_db)):
     """Detailed judge-facing system status & architectural stats."""
     return {
         "system_name": "RailMind - Railway Passenger Intelligence",
-        "version": "1.1.0",
-        "architecture_pipeline": "DATA -> EVENT -> STATE -> IMPACT -> DECISION -> ACTION -> STRANDS",
+        "version": "2.0.0",
+        "architecture_pipeline": "RAILRADAR API -> NORMALIZATION -> EVENT DETECTION -> JOURNEY STATE -> IMPACT -> ALTERNATIVE ENGINE -> DECISION ENGINE -> GPT4ALL -> SMS/EMAIL -> REACT",
         "database": {
             "type": "SQLite3",
             "file": "railway.db",
             "tables": {
+                "passengers": db.query(Passenger).count(),
+                "passenger_contacts": db.query(PassengerContact).count(),
                 "trains": db.query(Train).count(),
                 "journeys": db.query(Journey).count(),
+                "notifications": db.query(NotificationRecord).count(),
                 "events": db.query(RailwayEvent).count(),
                 "schedules": db.query(TrainSchedule).count(),
                 "fares": db.query(TrainFare).count(),
                 "availabilities": db.query(TrainAvailability).count()
             }
         },
-        "live_adapter": {
+        "railradar_api": {
+            "base_url": railradar_client.base_url,
+            "is_configured": railradar_client.is_configured,
             "mode": railway_adapter.current_data_source,
-            "provider": railway_adapter.client.provider,
-            "is_configured": railway_adapter.client.is_configured,
-            "last_fetched_at": railway_adapter.last_fetched_at.isoformat()
+            "last_fetched_at": railway_adapter.last_fetched_at.isoformat(),
+            "last_error": railway_adapter.last_error
         },
-        "strands_sdk": {
-            "status": "ACTIVE",
-            "provider": strands_assistant.provider_name,
-            "model": "strands-agents-v1.56"
+        "gpt4all_llm": {
+            "status": "ACTIVE (Local Inference)",
+            "model_name": gpt4all_agent.model_name,
+            "model_path": gpt4all_agent.model_path or "Default Cache"
+        },
+        "notifications": {
+            "sms_provider": sms_provider.provider,
+            "sms_configured": sms_provider.is_configured,
+            "email_provider": email_provider.provider,
+            "email_configured": email_provider.is_configured,
+            "total_dispatched": db.query(NotificationRecord).count()
         },
         "live_poller": {
             "interval_seconds": live_update_service.interval_seconds,
@@ -137,7 +161,145 @@ def get_system_status(db: Session = Depends(get_db)):
     }
 
 
+# ------------------- PASSENGER ONBOARDING & CONTACTS -------------------
+
+@app.post("/passengers", response_model=PassengerResponse)
+def register_passenger(req: PassengerRegistrationRequest, db: Session = Depends(get_db)):
+    """Registers passenger and contact preferences for SMS/Email notifications."""
+    p_id = f"PASS-{uuid.uuid4().hex[:8].upper()}"
+    now = datetime.datetime.utcnow()
+
+    # Create passenger record
+    passenger = Passenger(
+        id=p_id,
+        name=req.name.strip(),
+        email=req.email.strip().lower(),
+        phone=req.phone.strip(),
+        created_at=now
+    )
+    db.add(passenger)
+    db.commit()
+
+    # Create contact preferences
+    contact = PassengerContact(
+        contact_id=f"CONT-{uuid.uuid4().hex[:8].upper()}",
+        passenger_id=p_id,
+        name=req.name.strip(),
+        email=req.email.strip().lower(),
+        phone=req.phone.strip(),
+        email_notifications_enabled=req.email_notifications_enabled,
+        sms_notifications_enabled=req.sms_notifications_enabled,
+        created_at=now,
+        updated_at=now
+    )
+    db.add(contact)
+    db.commit()
+
+    return PassengerResponse(
+        passenger_id=p_id,
+        name=passenger.name,
+        email=passenger.email,
+        phone=passenger.phone,
+        email_notifications_enabled=contact.email_notifications_enabled,
+        sms_notifications_enabled=contact.sms_notifications_enabled,
+        created_at=now.isoformat()
+    )
+
+
 # ------------------- JOURNEY ENDPOINTS -------------------
+
+@app.post("/journey", response_model=JourneyDetailResponse)
+async def create_journey(req: JourneyCreateRequest, db: Session = Depends(get_db)):
+    """Creates a new active journey for monitoring."""
+    j_id = f"JRN-{uuid.uuid4().hex[:8].upper()}"
+    pnr = f"PNR{uuid.uuid4().hex[:6].upper()}"
+    now = datetime.datetime.utcnow()
+
+    # Verify stations or add fallback
+    from_st = db.query(Station).filter(Station.code == req.from_station.upper()).first()
+    if not from_st:
+        from_st = Station(code=req.from_station.upper(), name=f"{req.from_station.upper()} Station", city=req.from_station.upper(), state="State")
+        db.add(from_st)
+        db.commit()
+
+    to_st = db.query(Station).filter(Station.code == req.to_station.upper()).first()
+    if not to_st:
+        to_st = Station(code=req.to_station.upper(), name=f"{req.to_station.upper()} Station", city=req.to_station.upper(), state="State")
+        db.add(to_st)
+        db.commit()
+
+    # Verify or fetch train
+    train = db.query(Train).filter(Train.train_number == req.train_number).first()
+    if not train:
+        train = Train(
+            train_number=req.train_number,
+            train_name=f"Express {req.train_number}",
+            source_station_code=req.from_station.upper(),
+            destination_station_code=req.to_station.upper(),
+            departure_time="08:00",
+            arrival_time="16:00",
+            duration_minutes=480
+        )
+        db.add(train)
+        db.commit()
+
+    # Associate passenger
+    passenger = None
+    if req.passenger_id:
+        passenger = db.query(Passenger).filter(Passenger.id == req.passenger_id).first()
+    if not passenger:
+        passenger = db.query(Passenger).first()
+
+    p_id = passenger.id if passenger else "PASS-DEMO-01"
+
+    journey = Journey(
+        id=j_id,
+        pnr=pnr,
+        source_station_code=req.from_station.upper(),
+        destination_station_code=req.to_station.upper(),
+        journey_date=req.journey_date,
+        status="SAFE",
+        created_at=now,
+        updated_at=now
+    )
+    db.add(journey)
+    db.commit()
+
+    leg = JourneyLeg(
+        journey_id=j_id,
+        leg_order=1,
+        train_number=train.train_number,
+        from_station_code=req.from_station.upper(),
+        to_station_code=req.to_station.upper(),
+        scheduled_departure=train.departure_time,
+        scheduled_arrival=train.arrival_time,
+        actual_departure=train.departure_time,
+        actual_arrival=train.arrival_time,
+        delay_departure_min=0,
+        delay_arrival_min=0,
+        status="ON_TIME"
+    )
+    db.add(leg)
+
+    booking = Booking(
+        pnr=pnr,
+        passenger_id=p_id,
+        journey_id=j_id,
+        booking_status="CNF",
+        booking_class="3A",
+        coach="B2",
+        berth_number=32
+    )
+    db.add(booking)
+    db.commit()
+
+    # Generate initial action / recommendation
+    action_engine = ActionEngine(db)
+    action_engine.generate_recommendation(j_id)
+
+    state_engine = JourneyStateEngine(db)
+    return state_engine.serialize_journey_detail(journey)
+
 
 @app.get("/journey/{identifier}", response_model=JourneyDetailResponse)
 def get_journey(identifier: str, db: Session = Depends(get_db)):
@@ -174,7 +336,6 @@ async def get_train_status(train_number: str, date: Optional[str] = None):
 @app.get("/trains/{train_number}/schedule")
 async def get_train_schedule(train_number: str, db: Session = Depends(get_db)):
     """Fetch station intermediate halts schedule."""
-    # First check database for seeded schedule
     db_schedules = (
         db.query(TrainSchedule)
         .filter(TrainSchedule.train_number == train_number)
@@ -193,7 +354,6 @@ async def get_train_schedule(train_number: str, db: Session = Depends(get_db)):
             }
             for s in db_schedules
         ]
-    # Fallback to adapter
     return await railway_adapter.get_train_schedule(train_number)
 
 
@@ -220,7 +380,7 @@ async def get_train_fare(
             "base_fare": db_fare.base_fare,
             "other_charges": db_fare.other_charges,
             "total_fare": db_fare.total_fare,
-            "formatted_fare": f"₹{db_fare.total_fare}",
+            "formatted_fare": f"₹{int(db_fare.total_fare)}",
             "source": db_fare.source,
             "is_live": db_fare.is_live
         }
@@ -254,14 +414,7 @@ async def get_train_availability(
             "source": av.source,
             "is_live": av.is_live
         }
-    return {
-        "train_number": train_number,
-        "journey_date": journey_date,
-        "class_type": class_type,
-        "status": "Not provided",
-        "seats_available": 0,
-        "fare": None
-    }
+    return await railway_adapter.get_train_availability(train_number, journey_date, class_type)
 
 
 @app.get("/trains/{train_number}", response_model=TrainInfo)
@@ -285,7 +438,7 @@ def get_train_details(train_number: str, db: Session = Depends(get_db)):
     )
 
 
-# ------------------- INTELLIGENCE ENGINE ENDPOINTS -------------------
+# ------------------- INTELLIGENCE & ALTERNATIVE ENGINES -------------------
 
 @app.get("/impact/{journey_id}", response_model=ImpactResult)
 def get_journey_impact(journey_id: str, db: Session = Depends(get_db)):
@@ -326,13 +479,54 @@ def get_journey_recommendation(journey_id: str, db: Session = Depends(get_db)):
     return rec
 
 
-# ------------------- STRANDS AI EXPLANATION -------------------
+@app.get("/alternatives/{journey_id}")
+def get_journey_alternatives(journey_id: str, db: Session = Depends(get_db)):
+    """
+    Returns complete comparison matrix of feasible alternative trains and stations
+    including expected destination arrival, waiting time, transfer time, and availability.
+    """
+    state_engine = JourneyStateEngine(db)
+    journey = state_engine.get_journey_by_id_or_pnr(journey_id)
+    if not journey:
+        raise HTTPException(status_code=404, detail=f"Journey {journey_id} not found.")
 
-@app.post("/ai/explain", response_model=StrandsExplainResponse)
-async def explain_decision_with_strands(
-    req: StrandsExplainRequest,
+    alt_engine = AlternativeEngine(db)
+    return alt_engine.get_complete_alternative_comparison(journey.id)
+
+
+@app.get("/alternatives/stations/{journey_id}")
+def get_nearby_station_alternatives(journey_id: str, db: Session = Depends(get_db)):
+    """Returns specifically the alternative junction station options."""
+    state_engine = JourneyStateEngine(db)
+    journey = state_engine.get_journey_by_id_or_pnr(journey_id)
+    if not journey:
+        raise HTTPException(status_code=404, detail=f"Journey {journey_id} not found.")
+
+    alt_engine = AlternativeEngine(db)
+    legs = sorted(journey.legs, key=lambda l: l.leg_order)
+    first_leg = legs[0] if legs else None
+    if not first_leg:
+        return []
+
+    return alt_engine.find_nearby_station_alternatives(
+        current_station_code=first_leg.from_station_code,
+        destination_station_code=journey.destination_station_code,
+        current_time=first_leg.actual_departure or first_leg.scheduled_departure,
+        journey_date=journey.journey_date
+    )
+
+
+# ------------------- GPT4ALL LOCAL AI EXPLANATION -------------------
+
+@app.post("/ai/explain", response_model=GPT4AllExplainResponse)
+async def explain_decision_with_gpt4all(
+    req: GPT4AllExplainRequest,
     db: Session = Depends(get_db)
 ):
+    """
+    Synthesizes passenger-friendly explanation with GPT4All strictly based
+    on structured backend deterministic decision and alternative data.
+    """
     state_engine = JourneyStateEngine(db)
     journey = state_engine.get_journey_by_id_or_pnr(req.journey_id)
     if not journey:
@@ -346,103 +540,95 @@ async def explain_decision_with_strands(
     impact_engine = ImpactEngine(db)
     impact = impact_engine.calculate_journey_impact(journey.id)
 
-    # Combine into strict structured decision payload for Strands
+    alt_engine = AlternativeEngine(db)
+    alt_matrix = alt_engine.get_complete_alternative_comparison(journey.id)
+
+    # Assemble structured payload per Section 14
     structured_payload = {
-        "journey_id": journey.id,
-        "pnr": journey.pnr,
-        "situation_status": latest_decision["situation_status"],
-        "affected_train": impact.get("affected_train"),
-        "delay_minutes": impact.get("delay_minutes", 0),
-        "expected_arrival": impact.get("expected_arrival"),
-        "connection_train": impact.get("connection_train"),
-        "connection_departure": impact.get("connection_departure"),
-        "remaining_buffer_minutes": impact.get("remaining_buffer_minutes"),
-        "required_buffer_minutes": impact.get("required_buffer_minutes", 30),
-        "system_assessment": latest_decision["system_assessment"],
-        "reason": latest_decision["reason"]
+        "journey_status": latest_decision["situation_status"],
+        "current_train": {
+            "number": impact.get("affected_train", "12601"),
+            "delay_minutes": impact.get("delay_minutes", 0),
+            "expected_arrival": impact.get("expected_arrival", "08:30")
+        },
+        "alternatives": alt_matrix.get("alternatives", [])
     }
 
-    explanation_result = await strands_assistant.explain_decision(
-        structured_decision=structured_payload,
-        query=req.passenger_query
-    )
+    explanation_text = gpt4all_agent.explain_journey(structured_payload)
 
-    return StrandsExplainResponse(
+    return GPT4AllExplainResponse(
         journey_id=journey.id,
         structured_decision_summary=structured_payload,
-        explanation=explanation_result["explanation"],
-        model_provider=explanation_result["model_provider"],
-        model_name=explanation_result["model_name"],
-        timestamp=explanation_result["timestamp"]
+        explanation=explanation_text,
+        model_provider="GPT4All (Local LLM)",
+        model_name=gpt4all_agent.model_name,
+        timestamp=datetime.datetime.utcnow().isoformat()
     )
 
 
-# ------------------- EVENTS & SIMULATION CONSOLE -------------------
+# ------------------- NOTIFICATIONS FEED -------------------
+
+@app.get("/notifications", response_model=List[NotificationItem])
+def get_all_notifications(db: Session = Depends(get_db)):
+    """Returns complete notification audit log."""
+    notifs = (
+        db.query(NotificationRecord)
+        .order_by(NotificationRecord.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return [
+        NotificationItem(
+            notification_id=n.notification_id,
+            passenger_id=n.passenger_id,
+            journey_id=n.journey_id,
+            channel=n.channel,
+            notification_type=n.notification_type,
+            subject=n.subject,
+            message=n.message,
+            status=n.status,
+            provider_response=n.provider_response,
+            created_at=n.created_at.strftime("%Y-%m-%d %H:%M:%S") if n.created_at else "",
+            sent_at=n.sent_at.strftime("%Y-%m-%d %H:%M:%S") if n.sent_at else None
+        )
+        for n in notifs
+    ]
+
+
+@app.get("/notifications/{passenger_id}", response_model=List[NotificationItem])
+def get_passenger_notifications(passenger_id: str, db: Session = Depends(get_db)):
+    """Returns notifications for a specific passenger."""
+    notifs = (
+        db.query(NotificationRecord)
+        .filter(NotificationRecord.passenger_id == passenger_id)
+        .order_by(NotificationRecord.created_at.desc())
+        .all()
+    )
+    return [
+        NotificationItem(
+            notification_id=n.notification_id,
+            passenger_id=n.passenger_id,
+            journey_id=n.journey_id,
+            channel=n.channel,
+            notification_type=n.notification_type,
+            subject=n.subject,
+            message=n.message,
+            status=n.status,
+            provider_response=n.provider_response,
+            created_at=n.created_at.strftime("%Y-%m-%d %H:%M:%S") if n.created_at else "",
+            sent_at=n.sent_at.strftime("%Y-%m-%d %H:%M:%S") if n.sent_at else None
+        )
+        for n in notifs
+    ]
+
+
+# ------------------- EVENTS STREAM -------------------
 
 @app.get("/events")
 def get_events(limit: int = 20, db: Session = Depends(get_db)):
     event_engine = EventEngine(db)
     return event_engine.get_recent_events(limit=limit)
 
-
-@app.post("/events")
-async def post_event(req: EventInjectionRequest, db: Session = Depends(get_db)):
-    event_engine = EventEngine(db)
-    payload = req.details or {}
-    if req.delay_minutes:
-        payload["delay_minutes"] = req.delay_minutes
-
-    result = event_engine.process_event(
-        event_type=req.event_type,
-        train_id=req.train_id,
-        payload=payload,
-        effective_date=req.effective_date,
-        source=req.source
-    )
-    await broadcast_event_update(result)
-    return result
-
-
-@app.post("/simulate/delay")
-async def simulate_train_delay(req: QuickDelayRequest, db: Session = Depends(get_db)):
-    event_engine = EventEngine(db)
-    result = event_engine.process_event(
-        event_type="TRAIN_DELAY",
-        train_id=req.train_id,
-        payload={"delay_minutes": req.delay_minutes, "reason": "Signal failure near Katpadi"},
-        source="simulation"
-    )
-    await broadcast_event_update(result)
-    return result
-
-
-@app.post("/simulate/cancel")
-async def simulate_train_cancellation(train_id: str = "12601", db: Session = Depends(get_db)):
-    event_engine = EventEngine(db)
-    result = event_engine.process_event(
-        event_type="TRAIN_CANCELLED",
-        train_id=train_id,
-        payload={"reason": "Operational constraint / rolling stock issue"},
-        source="simulation"
-    )
-    await broadcast_event_update(result)
-    return result
-
-
-@app.post("/simulate/reset")
-async def simulate_reset(db: Session = Depends(get_db)):
-    reset_demo_journey(db)
-    reset_event = {
-        "event_type": "RESET",
-        "train_id": "12601",
-        "status": "RESET_COMPLETE",
-        "timestamp": datetime.datetime.utcnow().isoformat()
-    }
-    await broadcast_event_update(reset_event)
-    return {"message": "Demo journey reset to baseline safe state."}
-
-
-# ------------------- SSE STREAM -------------------
 
 @app.get("/events/stream")
 async def sse_event_stream(request: Request):

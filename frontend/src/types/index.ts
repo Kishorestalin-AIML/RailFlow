@@ -145,3 +145,76 @@ export interface StrandsExplanationResponse {
   model_name: string;
   timestamp: string;
 }
+
+export interface PassengerContactInfo {
+  passenger_id?: string;
+  name: string;
+  email: string;
+  phone: string;
+  email_notifications_enabled: boolean;
+  sms_notifications_enabled: boolean;
+}
+
+export interface AlternativeOptionItem {
+  option_letter?: string;
+  option_type: 'SAME_STATION' | 'ALTERNATIVE_STATION';
+  train_number: string;
+  train_name: string;
+  station_code: string;
+  station_name: string;
+  departure_time: string;
+  expected_destination_arrival: string;
+  waiting_time_minutes: number;
+  transfer_time_minutes: number;
+  train_travel_minutes: number;
+  total_journey_duration_minutes: number;
+  availability: string;
+  availability_status: string;
+  fare?: number;
+  formatted_fare: string;
+  is_feasible: boolean;
+  feasibility_reason: string;
+}
+
+export interface AlternativeComparisonMatrix {
+  journey_id: string;
+  current_journey: {
+    train: string;
+    train_name: string;
+    station: string;
+    station_code: string;
+    departure: string;
+    expected_destination_arrival: string;
+    transfer_minutes: number;
+    availability: string;
+    fare: number;
+    formatted_fare: string;
+    status: string;
+  };
+  alternatives: AlternativeOptionItem[];
+  all_evaluated_count: number;
+  feasible_count: number;
+}
+
+export interface NotificationRecordItem {
+  notification_id: string;
+  passenger_id?: string;
+  journey_id?: string;
+  channel: 'SMS' | 'EMAIL';
+  notification_type: string;
+  subject?: string;
+  message: string;
+  status: 'SENT' | 'FAILED' | 'SIMULATED';
+  provider_response?: string;
+  created_at: string;
+  sent_at?: string;
+}
+
+export interface GPT4AllExplanationResponse {
+  journey_id: string;
+  structured_decision_summary: Record<string, any>;
+  explanation: string;
+  model_provider: string;
+  model_name: string;
+  timestamp: string;
+}

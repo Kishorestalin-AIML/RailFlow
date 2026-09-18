@@ -133,8 +133,8 @@ class EventEngine:
 
         pipeline_steps.append({
             "time": now_time_str,
-            "step": "STRANDS_READY",
-            "title": "Strands Explanation Generated",
+            "step": "GPT4ALL_READY",
+            "title": "GPT4All Explanation Generated",
             "detail": "Passenger-facing natural language explanation synthesized without hallucination"
         })
 

@@ -6,7 +6,10 @@ import {
   TrainSearchResult,
   SystemHealth,
   RailwayEventItem,
-  StrandsExplanationResponse
+  AlternativeComparisonMatrix,
+  NotificationRecordItem,
+  GPT4AllExplanationResponse,
+  PassengerContactInfo
 } from '../types';
 
 const API_BASE = 'http://127.0.0.1:8000';
@@ -17,12 +20,44 @@ export async function fetchHealth(): Promise<SystemHealth> {
   return res.json();
 }
 
+export async function fetchSystemStatus(): Promise<any> {
+  const res = await fetch(`${API_BASE}/system/status`);
+  if (!res.ok) throw new Error('System status query failed');
+  return res.json();
+}
+
 export async function fetchJourney(idOrPnr: string): Promise<JourneyDetail> {
   const res = await fetch(`${API_BASE}/journey/${encodeURIComponent(idOrPnr)}`);
   if (!res.ok) {
     if (res.status === 404) throw new Error(`Journey '${idOrPnr}' not found.`);
     throw new Error('Failed to fetch journey details');
   }
+  return res.json();
+}
+
+export async function registerPassenger(data: PassengerContactInfo): Promise<any> {
+  const res = await fetch(`${API_BASE}/passengers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error('Passenger registration failed');
+  return res.json();
+}
+
+export async function createJourney(data: {
+  passenger_id?: string;
+  from_station: string;
+  to_station: string;
+  journey_date: string;
+  train_number: string;
+}): Promise<JourneyDetail> {
+  const res = await fetch(`${API_BASE}/journey`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  if (!res.ok) throw new Error('Journey creation failed');
   return res.json();
 }
 
@@ -57,16 +92,38 @@ export async function fetchRecommendation(journeyId: string): Promise<Recommenda
   return res.json();
 }
 
-export async function fetchStrandsExplanation(
+export async function fetchAlternatives(journeyId: string): Promise<AlternativeComparisonMatrix> {
+  const res = await fetch(`${API_BASE}/alternatives/${encodeURIComponent(journeyId)}`);
+  if (!res.ok) throw new Error('Failed to fetch journey alternatives');
+  return res.json();
+}
+
+export async function fetchStationAlternatives(journeyId: string): Promise<any[]> {
+  const res = await fetch(`${API_BASE}/alternatives/stations/${encodeURIComponent(journeyId)}`);
+  if (!res.ok) throw new Error('Failed to fetch station alternatives');
+  return res.json();
+}
+
+export async function fetchGPT4AllExplanation(
   journeyId: string,
   passengerQuery?: string
-): Promise<StrandsExplanationResponse> {
+): Promise<GPT4AllExplanationResponse> {
   const res = await fetch(`${API_BASE}/ai/explain`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ journey_id: journeyId, passenger_query: passengerQuery })
   });
-  if (!res.ok) throw new Error('Strands explanation call failed');
+  if (!res.ok) throw new Error('GPT4All explanation call failed');
+  return res.json();
+}
+
+// Backward-compatibility alias
+export const fetchStrandsExplanation = fetchGPT4AllExplanation;
+
+export async function fetchNotifications(passengerId?: string): Promise<NotificationRecordItem[]> {
+  const url = passengerId ? `${API_BASE}/notifications/${encodeURIComponent(passengerId)}` : `${API_BASE}/notifications`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Failed to fetch notifications log');
   return res.json();
 }
 
@@ -76,57 +133,6 @@ export async function fetchEvents(limit: number = 20): Promise<RailwayEventItem[
   return res.json();
 }
 
-export async function simulateDelay(trainId: string, delayMinutes: number): Promise<any> {
-  const res = await fetch(`${API_BASE}/simulate/delay`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ train_id: trainId, delay_minutes: delayMinutes })
-  });
-  if (!res.ok) throw new Error('Delay simulation failed');
-  return res.json();
-}
-
-export async function simulateCancellation(trainId: string): Promise<any> {
-  const res = await fetch(`${API_BASE}/simulate/cancel?train_id=${encodeURIComponent(trainId)}`, {
-    method: 'POST'
-  });
-  if (!res.ok) throw new Error('Cancellation simulation failed');
-  return res.json();
-}
-
-export async function simulateReset(): Promise<any> {
-  const res = await fetch(`${API_BASE}/simulate/reset`, {
-    method: 'POST'
-  });
-  if (!res.ok) throw new Error('Reset simulation failed');
-  return res.json();
-}
-
-export async function injectCustomEvent(eventData: {
-  event_type: string;
-  train_id: string;
-  delay_minutes?: number;
-  source?: string;
-  details?: Record<string, any>;
-}): Promise<any> {
-  const res = await fetch(`${API_BASE}/events`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(eventData)
-  });
-  if (!res.ok) throw new Error('Event injection failed');
-  return res.json();
-}
-
-export function createEventSource(onMessage: (event: any) => void): () => void {
-  const es = new EventSource(`${API_BASE}/events/stream`);
-  es.addEventListener('railway_event', (e) => {
-    try {
-      const parsed = JSON.parse(e.data);
-      onMessage(parsed);
-    } catch (err) {
-      console.error('SSE JSON error', err);
-    }
-  });
-  return () => es.close();
+export function createEventSource(): EventSource {
+  return new EventSource(`${API_BASE}/events/stream`);
 }

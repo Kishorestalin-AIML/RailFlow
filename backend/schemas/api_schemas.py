@@ -160,6 +160,60 @@ class StrandsExplainResponse(BaseModel):
     timestamp: str
 
 
+class PassengerRegistrationRequest(BaseModel):
+    name: str = Field(..., description="Passenger full name")
+    email: str = Field(..., description="Passenger email address")
+    phone: str = Field(..., description="International format mobile number, e.g. +91 98401 23456")
+    email_notifications_enabled: bool = True
+    sms_notifications_enabled: bool = True
+
+
+class PassengerResponse(BaseModel):
+    passenger_id: str
+    name: str
+    email: str
+    phone: str
+    email_notifications_enabled: bool = True
+    sms_notifications_enabled: bool = True
+    created_at: str
+
+
+class JourneyCreateRequest(BaseModel):
+    passenger_id: Optional[str] = None
+    from_station: str
+    to_station: str
+    journey_date: str
+    train_number: str
+
+
+class NotificationItem(BaseModel):
+    notification_id: str
+    passenger_id: Optional[str] = None
+    journey_id: Optional[str] = None
+    channel: str
+    notification_type: str
+    subject: Optional[str] = None
+    message: str
+    status: str
+    provider_response: Optional[str] = None
+    created_at: str
+    sent_at: Optional[str] = None
+
+
+class GPT4AllExplainRequest(BaseModel):
+    journey_id: str
+    passenger_query: Optional[str] = None
+
+
+class GPT4AllExplainResponse(BaseModel):
+    journey_id: str
+    structured_decision_summary: Dict[str, Any]
+    explanation: str
+    model_provider: str
+    model_name: str
+    timestamp: str
+
+
 class SystemHealthResponse(BaseModel):
     status: str
     database: str
